@@ -173,6 +173,75 @@ function Ensure-Dependencies {
 # Ensure dependencies are available FIRST before doing anything else
 Ensure-Dependencies
 
+<#
+.SYNOPSIS
+    Checks for updates to the repository and yt-dlp once per day.
+
+.DESCRIPTION
+    Runs "git pull --rebase" and "yt-dlp --update" if no update check has been
+    performed today. Uses a .last-update-check file in PSScriptRoot to track
+    the date of the last successful check.
+
+.EXAMPLE
+    Invoke-DailyUpdateCheck
+    Performs update check if one hasn't run today.
+#>
+function Invoke-DailyUpdateCheck {
+    [CmdletBinding()]
+    param()
+
+    $markerFile = Join-Path $PSScriptRoot ".last-update-check"
+    $today = (Get-Date).ToString("yyyy-MM-dd")
+
+    # Skip if already checked today
+    if (Test-Path $markerFile) {
+        $lastCheck = (Get-Content $markerFile -Raw).Trim()
+        if ($lastCheck -eq $today) {
+            Write-Verbose "Update check already performed today ($today), skipping"
+            return
+        }
+    }
+
+    Write-Host ""
+    Write-Host ">> Daily Update Check" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Git pull --rebase
+    $gitExe = Get-Command git -ErrorAction SilentlyContinue
+    if ($gitExe) {
+        Write-Host "Updating repository (git pull --rebase)..." -ForegroundColor Gray
+        try {
+            $gitOutput = & git -C $PSScriptRoot pull --rebase 2>&1
+            $gitOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        } catch {
+            Write-Host "  Warning: git pull failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Verbose "git not found in PATH, skipping repository update"
+    }
+
+    # yt-dlp --update
+    $ytDlpPath = Join-Path $PSScriptRoot "bin\yt-dlp.exe"
+    if (Test-Path $ytDlpPath) {
+        Write-Host "Updating yt-dlp..." -ForegroundColor Gray
+        try {
+            $ytdlpOutput = & $ytDlpPath --update 2>&1
+            $ytdlpOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        } catch {
+            Write-Host "  Warning: yt-dlp update failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    # Record today's date
+    $today | Set-Content -Path $markerFile -NoNewline
+    Write-Host ""
+    Write-Host "[OK] Update check complete" -ForegroundColor Green
+    Write-Host ""
+}
+
+# Run daily update check
+Invoke-DailyUpdateCheck
+
 #endregion
 
 #region Configuration Loading
@@ -196,8 +265,15 @@ function Get-Configuration {
         subtitleLanguages = "en.*"
         embedSubtitles = $true
         embedMetadata = $true
+        embedChapters = $true
         cleanFilenames = $true
         addReleaseYear = $true
+        correctTitleCase = $true
+        lowercaseWords = @(
+            'a', 'an', 'as', 'at', 'but', 'by', 'for', 'from', 'in', 'into',
+            'nor', 'of', 'on', 'or', 'so', 'the', 'to', 'up', 'with', 'yet',
+            'vs', 'vs.', 'v', 'v.', 'ft.', 'ft'
+        )
         phrasesToRemove = @(
             '\[Official Music Video\]',
             '\[Official Video\]',
@@ -262,8 +338,11 @@ function Get-Configuration {
             subtitleLanguages = if ($config.PSObject.Properties['subtitleLanguages']) { $config.subtitleLanguages } else { $defaultConfig.subtitleLanguages }
             embedSubtitles = if ($config.PSObject.Properties['embedSubtitles']) { $config.embedSubtitles } else { $defaultConfig.embedSubtitles }
             embedMetadata = if ($config.PSObject.Properties['embedMetadata']) { $config.embedMetadata } else { $defaultConfig.embedMetadata }
+            embedChapters = if ($config.PSObject.Properties['embedChapters']) { $config.embedChapters } else { $defaultConfig.embedChapters }
             cleanFilenames = if ($config.PSObject.Properties['cleanFilenames']) { $config.cleanFilenames } else { $defaultConfig.cleanFilenames }
             addReleaseYear = if ($config.PSObject.Properties['addReleaseYear']) { $config.addReleaseYear } else { $defaultConfig.addReleaseYear }
+            correctTitleCase = if ($config.PSObject.Properties['correctTitleCase']) { $config.correctTitleCase } else { $defaultConfig.correctTitleCase }
+            lowercaseWords = if ($config.PSObject.Properties['lowercaseWords']) { $config.lowercaseWords } else { $defaultConfig.lowercaseWords }
             phrasesToRemove = if ($config.PSObject.Properties['phrasesToRemove']) { $config.phrasesToRemove } else { $defaultConfig.phrasesToRemove }
         }
 
@@ -874,6 +953,115 @@ function Get-VideoMetadata {
 
 <#
 .SYNOPSIS
+    Applies title case formatting to a string, preserving certain lowercase words.
+
+.DESCRIPTION
+    Capitalizes the first letter of each word except for articles, prepositions,
+    and conjunctions (unless they are the first word). Preserves content within
+    parentheses and after certain punctuation.
+
+.PARAMETER Text
+    The text to convert to title case.
+
+.PARAMETER LowercaseWords
+    Array of words that should remain lowercase (unless they are the first word).
+
+.OUTPUTS
+    System.String
+    The text converted to title case.
+
+.EXAMPLE
+    ConvertTo-TitleCase -Text "the power of love" -LowercaseWords @('of', 'the')
+    Returns: "The Power of Love"
+#>
+function ConvertTo-TitleCase {
+    [CmdletBinding()]
+    param(
+        [string]$Text,
+        [string[]]$LowercaseWords
+    )
+
+    Write-Verbose "Converting to title case: $Text"
+
+    # Split by spaces while preserving the structure
+    $words = $Text -split '(\s+)'
+    $result = @()
+    $isFirstWord = $true
+
+    foreach ($word in $words) {
+        # Preserve whitespace as-is
+        if ($word -match '^\s+$') {
+            $result += $word
+            continue
+        }
+
+        # Skip empty strings
+        if ([string]::IsNullOrEmpty($word)) {
+            continue
+        }
+
+        # Extract the word without trailing punctuation
+        if ($word -match '^(.+?)([.,;:!?\)\]]*)$') {
+            $wordPart = $matches[1]
+            $punctuation = $matches[2]
+        } else {
+            $wordPart = $word
+            $punctuation = ''
+        }
+
+        # Check if word starts with opening punctuation
+        if ($wordPart -match '^([\(\[]+)(.+)$') {
+            $openingPunct = $matches[1]
+            $wordCore = $matches[2]
+        } else {
+            $openingPunct = ''
+            $wordCore = $wordPart
+        }
+
+        # Determine if this word should be lowercase
+        $shouldBeLowercase = $false
+        if (-not $isFirstWord) {
+            foreach ($lowerWord in $LowercaseWords) {
+                if ($wordCore -ieq $lowerWord) {
+                    $shouldBeLowercase = $true
+                    break
+                }
+            }
+        }
+
+        # Apply capitalization
+        if ($shouldBeLowercase) {
+            $convertedWord = $wordCore.ToLower()
+        } else {
+            # Check if word has mixed case (e.g., McFadden, iPhone, McDonald's)
+            # If it does, preserve the internal capitalization
+            $hasInternalCaps = $wordCore -cmatch '[a-z][A-Z]'
+
+            if ($hasInternalCaps) {
+                # Preserve existing capitalization, just ensure first letter is uppercase
+                $convertedWord = $wordCore.Substring(0, 1).ToUpper() + $wordCore.Substring(1)
+            } else {
+                # Standard title case: capitalize first letter, lowercase the rest
+                $convertedWord = $wordCore.Substring(0, 1).ToUpper() + $wordCore.Substring(1).ToLower()
+            }
+        }
+
+        # Reassemble with punctuation
+        $result += "$openingPunct$convertedWord$punctuation"
+
+        # Track if we've seen the first actual word
+        if ($wordCore -match '\w') {
+            $isFirstWord = $false
+        }
+    }
+
+    $finalResult = $result -join ''
+    Write-Verbose "Title case result: $finalResult"
+    return $finalResult
+}
+
+<#
+.SYNOPSIS
     Generates a cleaned filename by removing unwanted patterns.
 
 .DESCRIPTION
@@ -881,6 +1069,7 @@ function Get-VideoMetadata {
     - Removing YouTube video IDs (e.g., [w7Ioi9eheBU])
     - Removing common phrases (Official Video, Music Video, etc.)
     - Cleaning up extra spaces, dashes, and empty brackets
+    - Applying title case correction
     - Adding release year in parentheses before the extension
     Does not perform any file operations - only string manipulation.
 
@@ -892,6 +1081,12 @@ function Get-VideoMetadata {
 
 .PARAMETER PhrasesToRemove
     Array of regex patterns to remove from the filename (e.g., '\[Official Video\]', 'Music Video').
+
+.PARAMETER CorrectTitleCase
+    Whether to apply title case correction to the filename.
+
+.PARAMETER LowercaseWords
+    Array of words that should remain lowercase in titles (except at the beginning).
 
 .OUTPUTS
     System.String
@@ -910,7 +1105,9 @@ function Get-CleanedFilename {
     param(
         [string]$OriginalName,
         [string]$ReleaseYear,
-        [string[]]$PhrasesToRemove
+        [string[]]$PhrasesToRemove,
+        [bool]$CorrectTitleCase = $false,
+        [string[]]$LowercaseWords = @()
     )
 
     Write-Verbose "Cleaning filename: $OriginalName"
@@ -923,6 +1120,14 @@ function Get-CleanedFilename {
     foreach ($phrase in $PhrasesToRemove) {
         $newName = $newName -replace $phrase, ''
     }
+
+    # Replace "featuring" with "ft." (case insensitive, whole word)
+    $newName = $newName -ireplace '\bfeaturing\b', 'ft.'
+    $newName = $newName -ireplace '\bfeat\.\b', 'ft.'
+    $newName = $newName -ireplace '\bfeat\b', 'ft.'
+
+    # Replace "and" with "&" (case insensitive, whole word)
+    $newName = $newName -ireplace '\band\b', '&'
 
     # Sanitize invalid Windows filename characters (must be done before other cleanup)
     # Replace with safe alternatives rather than removing to preserve readability
@@ -947,11 +1152,25 @@ function Get-CleanedFilename {
     $newName = $newName -replace '\(\s*\)', ''  # Empty parentheses
     $newName = $newName.Trim()
 
+    # Apply title case correction if enabled
+    if ($CorrectTitleCase -and $LowercaseWords.Count -gt 0) {
+        Write-Verbose "Applying title case correction"
+        # Split filename and extension
+        $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($newName)
+        $extension = [System.IO.Path]::GetExtension($newName)
+
+        # Apply title case to the name part only
+        $nameWithoutExt = ConvertTo-TitleCase -Text $nameWithoutExt -LowercaseWords $LowercaseWords
+
+        # Reassemble
+        $newName = "$nameWithoutExt$extension"
+    }
+
     # Add release year before extension if available
     if ($ReleaseYear) {
         Write-Verbose "Adding release year: $ReleaseYear"
-        # Check if year already exists in filename
-        if ($newName -notmatch "\($ReleaseYear\)") {
+        # Check if any year (4 digits) already exists in filename
+        if ($newName -notmatch '\b(19|20)\d{2}\b') {
             # Split filename and extension
             $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($newName)
             $extension = [System.IO.Path]::GetExtension($newName)
@@ -959,7 +1178,7 @@ function Get-CleanedFilename {
             # Add year in parentheses before extension
             $newName = "$nameWithoutExt ($ReleaseYear)$extension"
         } else {
-            Write-Verbose "Year already exists in filename"
+            Write-Verbose "Year already exists in filename, skipping year addition"
         }
     }
 
@@ -1314,6 +1533,11 @@ if ($config.embedMetadata) {
     $arguments += "%(id)s:%(meta_comment)s"
 }
 
+# Add chapters option if enabled
+if ($config.embedChapters) {
+    $arguments += "--embed-chapters"
+}
+
 $arguments += "--paths"
 $arguments += "temp:$tempDir"
 $arguments += "--paths"
@@ -1371,7 +1595,12 @@ if ($videoFiles) {
         # Apply filename cleaning if enabled
         if ($shouldCleanFilenames) {
             $yearToAdd = if ($shouldAddReleaseYear) { $releaseYear } else { $null }
-            $cleanedName = Get-CleanedFilename -OriginalName $originalName -ReleaseYear $yearToAdd -PhrasesToRemove $config.phrasesToRemove
+            $cleanedName = Get-CleanedFilename `
+                -OriginalName $originalName `
+                -ReleaseYear $yearToAdd `
+                -PhrasesToRemove $config.phrasesToRemove `
+                -CorrectTitleCase $config.correctTitleCase `
+                -LowercaseWords $config.lowercaseWords
         } else {
             $cleanedName = $originalName
         }
