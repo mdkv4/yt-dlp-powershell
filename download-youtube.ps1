@@ -500,6 +500,7 @@ function Get-ScoredFormats {
                 ABitrate = if ($abr -gt 0) { "$abr kbps" } else { "N/A" }
                 Note = $formatInfo.format_note
                 Score = if ($isAudioOnly) { 0 } else { $score.total }
+                ScoreDetails = $score
             }
         }
 
@@ -597,19 +598,28 @@ function Get-UserFormatSelection {
         & $YtDlpPath @listArgs
     }
 
+    # Pre-select the best format before prompting
+    $bestFormat = $null
+    if ($scoredFormats) {
+        $bestFormat = $scoredFormats | Where-Object { $_.Score -gt 0 } | Select-Object -First 1
+    }
+
     Write-Host ""
     Write-Host "----------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "Enter format code " -ForegroundColor Yellow -NoNewline
     Write-Host "(or press " -ForegroundColor Gray -NoNewline
     Write-Host "Enter" -ForegroundColor White -NoNewline
-    Write-Host " for best quality): " -ForegroundColor Gray -NoNewline
+    if ($bestFormat) {
+        Write-Host " for best quality, " -ForegroundColor Gray -NoNewline
+        Write-Host "$($bestFormat.ID)" -ForegroundColor Green -NoNewline
+        Write-Host "): " -ForegroundColor Gray -NoNewline
+    } else {
+        Write-Host " for best quality): " -ForegroundColor Gray -NoNewline
+    }
     $selectedFormat = Read-Host
 
     if ($selectedFormat -eq "") {
         Write-Verbose "User selected automatic format, using highest scored format"
-
-        # Find the highest scored format (excluding audio-only formats with score 0)
-        $bestFormat = $scoredFormats | Where-Object { $_.Score -gt 0 } | Select-Object -First 1
 
         if ($bestFormat) {
             $selectedFormat = "$($bestFormat.ID)+bestaudio"
@@ -639,7 +649,10 @@ function Get-UserFormatSelection {
     Write-Host ""
 
     Write-Verbose "Final selected format: $selectedFormat"
-    return $selectedFormat
+    return @{
+        Format = $selectedFormat
+        ScoredFormats = $scoredFormats
+    }
 }
 
 <#
@@ -782,53 +795,30 @@ function Show-FormatSelection {
         [string]$YtDlpPath,
         [string]$BrowserString,
         [string]$Format,
-        [string]$Url
+        [string]$Url,
+        [array]$ScoredFormats = $null
     )
 
     Write-Host ""
     Write-Host ">> Format Selection & Quality Analysis" -ForegroundColor Cyan
 
-    # Get detailed format information
-    $formatCheckArgs = @(
-        "--cookies-from-browser", $BrowserString,
-        "--js-runtimes", "node",
-        "--format", $Format,
-        "--print", "%(format_id)s|%(format_note)s|%(vcodec)s|%(acodec)s|%(height)s|%(width)s|%(vbr)s|%(abr)s|%(fps)s|%(tbr)s",
-        "--no-warnings",
-        $Url
-    )
+    # Try to use pre-fetched scored format data
+    $matchedFormat = $null
+    if ($ScoredFormats) {
+        # Extract video format ID from format string (e.g., "137" from "137+bestaudio")
+        if ($Format -match '^(\d+)') {
+            $videoFormatId = $matches[1]
+            $matchedFormat = $ScoredFormats | Where-Object { $_.ID -eq $videoFormatId } | Select-Object -First 1
+        }
+    }
 
-    $formatOutput = & $YtDlpPath @formatCheckArgs 2>$null
-    if ($formatOutput) {
-        $parts = $formatOutput -split '\|'
-
-        # Parse format details
-        $formatId = $parts[0]
-        $formatNote = $parts[1]
-        $vcodec = $parts[2]
-        $acodec = $parts[3]
-        $height = if ($parts[4] -match '^\d+$') { [int]$parts[4] } else { 0 }
-        $width = if ($parts[5] -match '^\d+$') { [int]$parts[5] } else { 0 }
-        $vbr = if ($parts[6] -match '^[\d.]+$') { [int][double]$parts[6] } else { 0 }
-        $abr = if ($parts[7] -match '^[\d.]+$') { [int][double]$parts[7] } else { 0 }
-        $fps = if ($parts[8] -match '^[\d.]+$') { [int][double]$parts[8] } else { 0 }
-        $tbr = if ($parts[9] -match '^[\d.]+$') { [int][double]$parts[9] } else { 0 }
+    if ($matchedFormat -and $matchedFormat.ScoreDetails) {
+        $score = $matchedFormat.ScoreDetails
 
         # Display selected format
         Write-Host "Selected: " -ForegroundColor Green -NoNewline
-        Write-Host "$formatId - $formatNote" -ForegroundColor White
+        Write-Host "$($matchedFormat.ID) - $($matchedFormat.Note)" -ForegroundColor White
         Write-Host ""
-
-        # Calculate quality score
-        $formatInfo = @{
-            format_id = $formatId
-            format_note = $formatNote
-            height = $height
-            vbr = $vbr
-            vcodec = $vcodec
-            fps = $fps
-        }
-        $score = Get-FormatScore -FormatInfo $formatInfo
 
         # Display quality factors
         Write-Host "Quality Factors:" -ForegroundColor Cyan
@@ -841,11 +831,11 @@ function Show-FormatSelection {
         }
 
         Write-Host "  Resolution:  " -ForegroundColor Gray -NoNewline
-        Write-Host "$($width)x$($height)p " -ForegroundColor White -NoNewline
+        Write-Host "$($matchedFormat.Resolution) " -ForegroundColor White -NoNewline
         Write-Host "($([int]$score.resolution) pts)" -ForegroundColor DarkGray
 
         Write-Host "  Video Rate:  " -ForegroundColor Gray -NoNewline
-        Write-Host "$($vbr) kbps " -ForegroundColor White -NoNewline
+        Write-Host "$($matchedFormat.VBitrate) " -ForegroundColor White -NoNewline
         if ($score.details.codecMultiplier -ne 1.0) {
             Write-Host "(~$($score.details.effectiveBitrate) effective) " -ForegroundColor DarkGray -NoNewline
         }
@@ -861,24 +851,112 @@ function Show-FormatSelection {
         }
         Write-Host "($($score.codec) pts)" -ForegroundColor DarkGray
 
-        if ($fps -gt 0) {
+        if ($score.details.fps -gt 0) {
             Write-Host "  Frame Rate:  " -ForegroundColor Gray -NoNewline
-            Write-Host "$fps fps " -ForegroundColor White -NoNewline
+            Write-Host "$($score.details.fps) fps " -ForegroundColor White -NoNewline
             Write-Host "($($score.fps) pts)" -ForegroundColor DarkGray
         }
 
-        if ($abr -gt 0) {
+        if ($matchedFormat.ABitrate -ne "N/A") {
             Write-Host "  Audio Rate:  " -ForegroundColor Gray -NoNewline
-            Write-Host "$abr kbps ($acodec)" -ForegroundColor White
+            Write-Host "$($matchedFormat.ABitrate) ($($matchedFormat.ACodec))" -ForegroundColor White
         }
 
         Write-Host ""
         Write-Host "  Total Score: " -ForegroundColor Cyan -NoNewline
         Write-Host "$($score.total) points" -ForegroundColor White
-
     } else {
-        Write-Host "Format:   " -ForegroundColor Gray -NoNewline
-        Write-Host "$Format" -ForegroundColor White
+        # Fallback: fetch format info from yt-dlp when scored formats not available
+        $formatCheckArgs = @(
+            "--cookies-from-browser", $BrowserString,
+            "--js-runtimes", "node",
+            "--format", $Format,
+            "--print", "%(format_id)s|%(format_note)s|%(vcodec)s|%(acodec)s|%(height)s|%(width)s|%(vbr)s|%(abr)s|%(fps)s|%(tbr)s",
+            "--no-warnings",
+            $Url
+        )
+
+        $formatOutput = & $YtDlpPath @formatCheckArgs 2>$null
+        if ($formatOutput) {
+            $parts = $formatOutput -split '\|'
+
+            # Parse format details
+            $formatId = $parts[0]
+            $formatNote = $parts[1]
+            $vcodec = $parts[2]
+            $acodec = $parts[3]
+            $height = if ($parts[4] -match '^\d+$') { [int]$parts[4] } else { 0 }
+            $width = if ($parts[5] -match '^\d+$') { [int]$parts[5] } else { 0 }
+            $vbr = if ($parts[6] -match '^[\d.]+$') { [int][double]$parts[6] } else { 0 }
+            $abr = if ($parts[7] -match '^[\d.]+$') { [int][double]$parts[7] } else { 0 }
+            $fps = if ($parts[8] -match '^[\d.]+$') { [int][double]$parts[8] } else { 0 }
+            $tbr = if ($parts[9] -match '^[\d.]+$') { [int][double]$parts[9] } else { 0 }
+
+            # Display selected format
+            Write-Host "Selected: " -ForegroundColor Green -NoNewline
+            Write-Host "$formatId - $formatNote" -ForegroundColor White
+            Write-Host ""
+
+            # Calculate quality score
+            $formatInfo = @{
+                format_id = $formatId
+                format_note = $formatNote
+                height = $height
+                vbr = $vbr
+                vcodec = $vcodec
+                fps = $fps
+            }
+            $score = Get-FormatScore -FormatInfo $formatInfo
+
+            # Display quality factors
+            Write-Host "Quality Factors:" -ForegroundColor Cyan
+
+            # Premium status (if applicable)
+            if ($score.details.isPremium) {
+                Write-Host "  Premium:     " -ForegroundColor Gray -NoNewline
+                Write-Host "Yes " -ForegroundColor Green -NoNewline
+                Write-Host "($($score.premium) pts)" -ForegroundColor DarkGray
+            }
+
+            Write-Host "  Resolution:  " -ForegroundColor Gray -NoNewline
+            Write-Host "$($width)x$($height)p " -ForegroundColor White -NoNewline
+            Write-Host "($([int]$score.resolution) pts)" -ForegroundColor DarkGray
+
+            Write-Host "  Video Rate:  " -ForegroundColor Gray -NoNewline
+            Write-Host "$($vbr) kbps " -ForegroundColor White -NoNewline
+            if ($score.details.codecMultiplier -ne 1.0) {
+                Write-Host "(~$($score.details.effectiveBitrate) effective) " -ForegroundColor DarkGray -NoNewline
+            }
+            Write-Host "($([int]$score.bitrate) pts)" -ForegroundColor DarkGray
+
+            Write-Host "  Codec:       " -ForegroundColor Gray -NoNewline
+            Write-Host "$($score.details.codecName) " -ForegroundColor $score.details.codecColor -NoNewline
+            $efficiencyPct = [int](($score.details.codecMultiplier - 1.0) * 100)
+            if ($efficiencyPct -gt 0) {
+                Write-Host "(+$efficiencyPct% efficiency) " -ForegroundColor DarkGray -NoNewline
+            } elseif ($efficiencyPct -lt 0) {
+                Write-Host "($efficiencyPct% efficiency) " -ForegroundColor DarkGray -NoNewline
+            }
+            Write-Host "($($score.codec) pts)" -ForegroundColor DarkGray
+
+            if ($fps -gt 0) {
+                Write-Host "  Frame Rate:  " -ForegroundColor Gray -NoNewline
+                Write-Host "$fps fps " -ForegroundColor White -NoNewline
+                Write-Host "($($score.fps) pts)" -ForegroundColor DarkGray
+            }
+
+            if ($abr -gt 0) {
+                Write-Host "  Audio Rate:  " -ForegroundColor Gray -NoNewline
+                Write-Host "$abr kbps ($acodec)" -ForegroundColor White
+            }
+
+            Write-Host ""
+            Write-Host "  Total Score: " -ForegroundColor Cyan -NoNewline
+            Write-Host "$($score.total) points" -ForegroundColor White
+        } else {
+            Write-Host "Format:   " -ForegroundColor Gray -NoNewline
+            Write-Host "$Format" -ForegroundColor White
+        }
     }
     Write-Host ""
 }
@@ -1184,6 +1262,7 @@ function Get-CleanedFilename {
 
     # Final cleanup: remove any remaining double spaces and trim
     $newName = $newName -replace '\s+', ' '
+    $newName = $newName -replace '\s+(\.\w+)$', '$1'  # Remove space before extension
     $newName = $newName.Trim()
 
     Write-Verbose "Cleaned filename: $newName"
@@ -1494,8 +1573,11 @@ if ($ListFormats) {
 }
 
 # If no format specified, list formats and prompt user
+$scoredFormats = $null
 if ($Format -eq "") {
-    $Format = Get-UserFormatSelection -YtDlpPath $ytDlpPath -BrowserString $browserString -Url $normalizedUrl -DefaultFormat $config.defaultFormat
+    $result = Get-UserFormatSelection -YtDlpPath $ytDlpPath -BrowserString $browserString -Url $normalizedUrl -DefaultFormat $config.defaultFormat
+    $Format = $result.Format
+    $scoredFormats = $result.ScoredFormats
 }
 
 # Create temporary directory for download artifacts (include video ID to prevent collisions)
@@ -1556,7 +1638,7 @@ if ($AdditionalArgs.Count -gt 0) {
 }
 
 # Show selected format
-Show-FormatSelection -YtDlpPath $ytDlpPath -BrowserString $browserString -Format $Format -Url $normalizedUrl
+Show-FormatSelection -YtDlpPath $ytDlpPath -BrowserString $browserString -Format $Format -Url $normalizedUrl -ScoredFormats $scoredFormats
 
 # Wrap download and processing in try/finally to ensure cleanup
 try {
