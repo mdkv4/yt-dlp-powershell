@@ -1213,7 +1213,7 @@ function Get-CleanedFilename {
     $newName = $newName -replace '[\x00-\x1F]', ''    # Control characters -> remove
 
     # Replace problematic Unicode characters that might cause issues
-    $newName = $newName -replace '｜', '|'  # Full-width vertical bar -> ASCII pipe
+    $newName = $newName -replace '｜', '-'  # Full-width vertical bar -> dash (| is invalid in Windows filenames)
     $newName = $newName -replace '—', '-'  # Em dash -> regular dash
     $newName = $newName -replace '–', '-'  # En dash -> regular dash
     $newName = $newName -replace '[''ʻ]', "'"  # Smart quotes -> straight quote
